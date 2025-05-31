@@ -15,10 +15,9 @@
 
 
 import igraph
-import keras.callbacks
+import tensorflow.keras.callbacks
 import tensorflow as tf
 import tensorflow.keras.utils
-import tensorflow_addons as tfa
 import gc
 
 from tensorflow.keras.layers import Layer, Dense, Lambda, Dot, Activation, Concatenate,Dense, Input,MultiHeadAttention
@@ -50,7 +49,7 @@ from igraph import *
 import numpy as np
 from Connectome_Reader import Connectome_Reader
 
-from keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from PIL import Image, ImageOps
 import pydot
 import graphviz
@@ -66,13 +65,14 @@ parser.add_argument('--batch_size',                type=int,     help='batch siz
 parser.add_argument('--num_epochs',                type=int,     help='number of epochs',           default = 1000)
 parser.add_argument('--seed',                      type=int,     help='seed',                       default = 6386)
 parser.add_argument('--learning_rate',             type=float,   help='Learning Rate %%%',          default = 0.001) #gli ho messo uno zero in più
+parser.add_argument('--min_learning_rate', type=float,   help='(unused placeholder)', default=0.0)
 parser.add_argument('--gpus',                      type=int,     help='The number of GPUs to use',  default = 1 )
 parser.add_argument('--gpuids',                    type=str,     help='IDs of GPUs to use 0,1,2,3', default = '0,1,2,3')
 parser.add_argument('--model_code',                type=str,     help='model code number',          default = "original")
 parser.add_argument('--path_to_connectome',        type=str,     help='path_to_connectome',         default = './celegans/celegans.graphml')
 #parser.add_argument('--path_to_connectome',        type=str,     help='path_to_connectome',         default = './celegans/graph_clique_test.graphml')
 parser.add_argument('--subd',                      type=str,     help='subd',                       default = "org")
-parser.add_argument('--save_to',                   type=str,     help='save_to',                    default = './ElegansMNIST_Autoencoder_dir/mnist_autoenc/')
+parser.add_argument('--save_to',                   type=str,     help='save_to',                    default = './mnist_autoenc/')
 
 args = parser.parse_args()
 
@@ -144,6 +144,59 @@ class bcolors:
 
 def exists(val):
     return val is not None
+
+class F1Metric(tf.keras.metrics.Metric):
+    """
+    Computes (micro) F1-score for binary data, given a fixed threshold.
+
+    - y_true is expected to be floats in [0,1], effectively 0/1 after preprocessing.
+    - y_pred is a float in [0,1]. We compare (y_pred >= threshold) to decide positive class.
+    """
+
+    def __init__(self, threshold=0.5, name="f1_score", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.threshold = threshold
+        # Track true positives, false positives, false negatives
+        self.tp = self.add_weight(name="tp", initializer="zeros")
+        self.fp = self.add_weight(name="fp", initializer="zeros")
+        self.fn = self.add_weight(name="fn", initializer="zeros")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # y_true: shape [batch_size, ...], floats 0/1
+        # y_pred: shape [batch_size, ...], floats [0,1]
+        # Binarize predictions & truths
+        y_pred_bin = tf.cast(y_pred >= self.threshold, tf.float32)
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+
+        # Flatten everything to compute counts over all pixels/elements
+        y_pred_bin = tf.reshape(y_pred_bin, [-1])
+        y_true_bin = tf.reshape(y_true_bin, [-1])
+
+        # True positives = predicted=1 & true=1
+        tp = tf.reduce_sum(y_true_bin * y_pred_bin)
+        # False positives = predicted=1 & true=0
+        fp = tf.reduce_sum((1.0 - y_true_bin) * y_pred_bin)
+        # False negatives = predicted=0 & true=1
+        fn = tf.reduce_sum(y_true_bin * (1.0 - y_pred_bin))
+
+        # Accumulate
+        self.tp.assign_add(tp)
+        self.fp.assign_add(fp)
+        self.fn.assign_add(fn)
+
+    def result(self):
+        # precision = TP / (TP + FP), recall = TP / (TP + FN)
+        precision = self.tp / (self.tp + self.fp + 1e-7)
+        recall = self.tp / (self.tp + self.fn + 1e-7)
+        # F1 = 2 * (precision * recall) / (precision + recall)
+        return 2.0 * precision * recall / (precision + recall + 1e-7)
+
+    def reset_states(self):
+        # Clear out the variables for a new epoch or new evaluation
+        self.tp.assign(0.0)
+        self.fp.assign(0.0)
+        self.fn.assign(0.0)
+
 
 ### Autoencoder Model MNIST
 #with @tf.strategy?
@@ -251,10 +304,10 @@ class ElegansMnist280Recon:
                     coord_0 = int(i)
                     coord_1 = int(j)
 
-                    if not isinstance(sensors[coord_0], keras.engine.sequential.Sequential):
+                    if not isinstance(sensors[coord_0], tf.keras.Sequential):
                         if self.gg.vs()['role'][coord_0] in ["S", 0]:
                             if self.gg.vs()['role'][coord_1] in ["M", 1]:
-                                if isinstance(motors[coord_1], keras.engine.sequential.Sequential):
+                                if isinstance(motors[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
 
                                     e = tf.TensorSpec.from_spec(sensors[coord_0],
@@ -282,7 +335,7 @@ class ElegansMnist280Recon:
                                         self.net_tensor_track(coord_0, coord_1, gg_el["synapse_type"])
 
                             if self.gg.vs()['role'][coord_1] in ["NA", 2]:
-                                if isinstance(interneurons[coord_1], keras.engine.sequential.Sequential):
+                                if isinstance(interneurons[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     e = tf.TensorSpec.from_spec(sensors[coord_0],
                                                                 self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -318,10 +371,10 @@ class ElegansMnist280Recon:
                 try:
                     coord_0 = int(i)
                     coord_1 = int(j)
-                    if not isinstance(interneurons[coord_0], keras.engine.sequential.Sequential):
+                    if not isinstance(interneurons[coord_0], tf.keras.Sequential):
                         if self.gg.vs()['role'][coord_0] in ["NA", 2]:
                             if self.gg.vs()['role'][coord_1] in ["S", 1]:
-                                if isinstance(sensors[coord_1], keras.engine.sequential.Sequential):
+                                if isinstance(sensors[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     e = tf.TensorSpec.from_spec(interneurons[coord_0],
                                                                 self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -347,7 +400,7 @@ class ElegansMnist280Recon:
                                         self.net_tensor_track(coord_0, coord_1, gg_el["synapse_type"])
 
                             if self.gg.vs()['role'][coord_1] in ["M", 1]:
-                                if isinstance(motors_to[coord_1], keras.engine.sequential.Sequential):
+                                if isinstance(motors_to[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     e = tf.TensorSpec.from_spec(interneurons[coord_0],
                                                                 self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -383,10 +436,10 @@ class ElegansMnist280Recon:
                 try:
                     coord_0 = int(i)
                     coord_1 = int(j)
-                    if not isinstance(motors[coord_0], keras.engine.sequential.Sequential):
+                    if not isinstance(motors[coord_0], tf.keras.Sequential):
                         if self.gg.vs()['role'][coord_0] in ["M", 1]:
                             if self.gg.vs()['role'][coord_1] in ["S", 0]:
-                                if isinstance(sensors[coord_1], keras.engine.sequential.Sequential):
+                                if isinstance(sensors[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     e = tf.TensorSpec.from_spec(motors[coord_0],
                                                                 self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -413,7 +466,7 @@ class ElegansMnist280Recon:
                                         self.net_tensor_track(coord_0, coord_1, gg_el["synapse_type"])
 
                             if self.gg.vs()['role'][coord_1] in ["NA", 2]:
-                                if isinstance(interneurons[coord_1], keras.engine.sequential.Sequential):
+                                if isinstance(interneurons[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     e = tf.TensorSpec.from_spec(motors[coord_0],
                                                                 self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -444,11 +497,11 @@ class ElegansMnist280Recon:
                 except igraph._igraph.InternalError:
                     continue
 
-        # sensors       = [item for item in sensors if not isinstance(item, keras.engine.sequential.Sequential)]
-        # motors        = [item for item in motors if not isinstance(item, keras.engine.sequential.Sequential)]
-        # interneurons  = [item for item in interneurons if not isinstance(item, keras.engine.sequential.Sequential)]
+        # sensors       = [item for item in sensors if not isinstance(item, tf.keras.Sequential)]
+        # motors        = [item for item in motors if not isinstance(item, tf.keras.Sequential)]
+        # interneurons  = [item for item in interneurons if not isinstance(item, tf.keras.Sequential)]
 
-        # x2 = [item for item in x2 if not isinstance(item, keras.engine.sequential.Sequential)]
+        # x2 = [item for item in x2 if not isinstance(item, tf.keras.Sequential)]
         # print(x2)
         # input()
 
@@ -463,10 +516,10 @@ class ElegansMnist280Recon:
                 try:
                     coord_0 = int(i)
                     coord_1 = int(j)
-                    if not isinstance(sensors[coord_0], keras.engine.sequential.Sequential):
+                    if not isinstance(sensors[coord_0], tf.keras.Sequential):
                         if self.gg.vs()['role'][coord_0] in ["S", 0]:
                             if self.gg.vs()['role'][coord_1] in ["S", 0]:
-                                if not isinstance(motors[coord_1], keras.engine.sequential.Sequential):
+                                if not isinstance(motors[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     # e = tf.TensorSpec.from_spec(sensors[coord_0],
                                     #                            self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -496,10 +549,10 @@ class ElegansMnist280Recon:
                 try:
                     coord_0 = int(i)
                     coord_1 = int(j)
-                    if not isinstance(interneurons[coord_0], keras.engine.sequential.Sequential):
+                    if not isinstance(interneurons[coord_0], tf.keras.Sequential):
                         if self.gg.vs()['role'][coord_0] in ["NA", 2]:
                             if self.gg.vs()['role'][coord_1] in ["NA", 2]:
-                                if not isinstance(interneurons[coord_1], keras.engine.sequential.Sequential):
+                                if not isinstance(interneurons[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     # e = tf.TensorSpec.from_spec(interneurons[coord_0],
                                     #                            self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -527,10 +580,10 @@ class ElegansMnist280Recon:
                 try:
                     coord_0 = int(i)
                     coord_1 = int(j)
-                    if not isinstance(motors[coord_0], keras.engine.sequential.Sequential):
+                    if not isinstance(motors[coord_0], tf.keras.Sequential):
                         if self.gg.vs()['role'][coord_0] in ["M", 1]:
                             if self.gg.vs()['role'][coord_1] in ["M", 1]:
-                                if not isinstance(sensors[coord_1], keras.engine.sequential.Sequential):
+                                if not isinstance(sensors[coord_1], tf.keras.Sequential):
                                     gg_el = self.gg.es[self.gg.get_eid(coord_0, coord_1)]
                                     # e = tf.TensorSpec.from_spec(motors[coord_0],
                                     #                            self.t_n(str(self.gg.vs()['role'][coord_1]),
@@ -551,7 +604,7 @@ class ElegansMnist280Recon:
                 except igraph._igraph.InternalError:
                     continue
 
-        # x2 = [item for item in x2 if not isinstance(item, keras.engine.sequential.Sequential)]
+        # x2 = [item for item in x2 if not isinstance(item, tf.keras.Sequential)]
         # print(x2)
         # input()
         return sensors, motors, interneurons
@@ -583,9 +636,9 @@ class ElegansMnist280Recon:
                                                                           motors_to, interneurons_to, patch_pattern,
                                                                           activation_line)
 
-        sensors = [item for item in sensors if not isinstance(item, keras.engine.sequential.Sequential)]
-        motors = [item for item in motors if not isinstance(item, keras.engine.sequential.Sequential)]
-        interneurons = [item for item in interneurons if not isinstance(item, keras.engine.sequential.Sequential)]
+        sensors = [item for item in sensors if not isinstance(item, tf.keras.Sequential)]
+        motors = [item for item in motors if not isinstance(item, tf.keras.Sequential)]
+        interneurons = [item for item in interneurons if not isinstance(item, tf.keras.Sequential)]
 
         indirect_count = 0
         direct_count = 0
@@ -594,70 +647,62 @@ class ElegansMnist280Recon:
         interneuron_count = 0
         mot_out = []
         unique_name = 0
-        for j in range(0, len(motors), 1):
+        for j in range(len(motors)):
             try:
-                if not isinstance(motors[int(j)], keras.engine.sequential.Sequential):
-                    if "SM" in motors[int(j)].__dict__['_name']:  # nota era 1
-                        mot_out.append(motors[int(j)])
-                    if "NAM" in motors[int(j)].__dict__['_name']:  # nota era 1
-                        mot_out.append(motors[int(j)])
-                    if "MM" in motors[int(j)].__dict__['_name']:  # nota era 1
-                        mot_out.append(motors[int(j)])
-
-            except IndexError:
-                print(motors[int(j)])
-                input()
-
-            except KeyError:
+                if not isinstance(motors[j], tf.keras.Sequential):
+                    # motors[j] is a KerasTensor; its _keras_history[0] is the Layer object
+                    layer_obj  = motors[j]._keras_history[0]
+                    layer_name = layer_obj.name
+                    print(f"  [motor #{j}] layer_name = {layer_name}")
+                    if "SM" in layer_name:
+                        mot_out.append(motors[j])
+                    if "NAM" in layer_name:
+                        mot_out.append(motors[j])
+                    if "MM" in layer_name:
+                        mot_out.append(motors[j])
+            except (IndexError, KeyError):
                 continue
 
-        for j in range(0, len(sensors), 1):
+        # 1) count in “sensors”:
+        for j in range(len(sensors)):
             try:
-                if not isinstance(sensors[int(j)], keras.engine.sequential.Sequential):
-                    sensor_count += 1
-                    unique_name += 1
-                    if "C" in sensors[int(j)].__dict__['_name']:  # nota era 1
-                        direct_count += 1
-                    if "E" in sensors[int(j)].__dict__['_name']:  # nota era 1
-                        indirect_count += 1
-            except IndexError:
-                print(motors[int(j)])
-                input()
-
-            except KeyError:
+                layer_obj  = motors[j]._keras_history[0]
+                layer_name = layer_obj.name
+                sensor_count += 1
+                unique_name += 1
+                if "C" in layer_name: 
+                    direct_count += 1
+                if "E" in layer_name:
+                    indirect_count += 1
+            except (IndexError, KeyError):
                 continue
 
-        for j in range(0, len(motors), 1):
+        # 2) count in “motors”:
+        for j in range(len(motors)):
             try:
-                if not isinstance(motors[int(j)], keras.engine.sequential.Sequential):
-                    motor_count += 1
-                    unique_name += 1
-                    if "C" in motors[int(j)].__dict__['_name']:  # nota era 1
-                        direct_count += 1
-                    if "E" in motors[int(j)].__dict__['_name']:  # nota era 1
-                        indirect_count += 1
-            except IndexError:
-                print(motors[int(j)])
-                input()
-
-            except KeyError:
+                layer_obj  = motors[j]._keras_history[0]
+                layer_name = layer_obj.name
+                motor_count += 1
+                unique_name += 1
+                if "C" in layer_name:
+                    direct_count += 1
+                if "E" in layer_name:
+                    indirect_count += 1
+            except (IndexError, KeyError):
                 continue
 
-        for j in range(0, len(interneurons), 1):
+        # 3) count in “interneurons”:
+        for j in range(len(interneurons)):
             try:
-                if not isinstance(interneurons[int(j)], keras.engine.sequential.Sequential):
-                    interneuron_count += 1
-                    unique_name += 1
-                    if "C" in interneurons[int(j)].__dict__['_name']:  # nota era 1
-                        direct_count += 1
-                    if "E" in interneurons[int(j)].__dict__['_name']:  # nota era 1
-                        indirect_count += 1
-
-            except IndexError:
-                print(motors[int(j)])
-                input()
-
-            except KeyError:
+                layer_obj  = motors[j]._keras_history[0]
+                layer_name = layer_obj.name
+                interneuron_count += 1
+                unique_name += 1
+                if "C" in layer_name:
+                    direct_count += 1
+                if "E" in layer_name:
+                    indirect_count += 1
+            except (IndexError, KeyError):
                 continue
 
         print("Sensors")
@@ -680,11 +725,15 @@ class ElegansMnist280Recon:
         print(bcolors.OKBLUE + "Motor   layers (M)   : " + bcolors.ENDC + str(motor_count))
         print(bcolors.OKGREEN + "Unique name count    : " + bcolors.ENDC + str(unique_name))
 
-        merged_m1 = tf.stack(mot_out)
+        # Replace tf-stack implementation
+        merged_m1 =  merged_m1 = tf.keras.layers.Lambda(lambda tensors: tf.stack(tensors, axis=0))(mot_out)
         merged_m1 = Rearrange('a b c -> b a c')(merged_m1)
-        x = tf.expand_dims(x, axis=1)
+
+        # Rearrange
+        x_expanded = tf.keras.layers.Lambda(lambda t: tf.expand_dims(t, axis=1))(x)
+
         l_x_mot_out = MultiHeadAttention(num_heads=motor_count, key_dim=32, attention_axes=(1, 2))
-        output_tensor, _ = l_x_mot_out(x, merged_m1, return_attention_scores=True)
+        output_tensor, _ = l_x_mot_out(x_expanded, merged_m1, return_attention_scores=True)
         print(output_tensor.shape)
         output_tensor = tf.keras.layers.LayerNormalization()(output_tensor)
 
@@ -730,8 +779,8 @@ class ElegansMnist280Recon:
         xp = tf.keras.layers.LayerNormalization(name="S_init")(xp)
         xp_l.append(xp)
         xe_l.append(self.elegans_latent_graph_total(xp_l[-1], patch_pattern, activation_line=act_fun))
-        xxp = tf.stack(xp_l)
-        xxe = tf.stack(xe_l)
+        xxp = tf.keras.layers.Lambda(lambda L: tf.stack(L, axis=0))(xp_l)
+        xxe = tf.keras.layers.Lambda(lambda L: tf.stack(L, axis=0))(xe_l)
 
 
 
@@ -798,8 +847,8 @@ class ElegansMnist280Recon:
 
         opt = tf.keras.optimizers.Adam(learning_rate=m_lr)
 
-        met0  = tfa.metrics.F1Score(num_classes=2, average="micro", threshold=0.252, name="m0")
-        met1  = tfa.metrics.F1Score(num_classes=2, average="micro", threshold=0.25, name="m1")
+        met0  = F1Metric(threshold=0.252, name="m0")
+        met1  = F1Metric(threshold=0.25,  name="m1")
 
 
         model = tf.keras.Model(input_img, [decoded])
@@ -813,7 +862,7 @@ class ElegansMnist280Recon:
         return model
 
     def build6_train(self, m_lr=0.01, m_epochs=3, batch_size=32, ratio=1, node_number=280, patch_size=28 ):
-        checkpoint_filepath = save_to + "/" + subd + "_last_best.hdf5"
+        checkpoint_filepath = save_to + "/" + subd + "_last_best.keras"
         cp_callback = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_filepath,
             monitor='val_m1',
@@ -826,10 +875,10 @@ class ElegansMnist280Recon:
         #my_callback = check_gradient()
 
 
-        node_number= np.int(self.gg.ecount())
+        node_number = int(self.gg.ecount())
         model = self.build6(m_lr, m_epochs, batch_size, ratio, node_number, patch_size)
 
-        csv_callback = keras.callbacks.CSVLogger(save_to + "/logs.csv", separator=',', append=False)
+        csv_callback = tf.keras.callbacks.CSVLogger(save_to + "/logs.csv", separator=',', append=False)
         #tensorboard --logdir=/home/neuronelab/Scrivania/multi-dyad/cc10/logs
         model.fit(self.x_train, self.x_train, shuffle=True, batch_size=batch_size, epochs=m_epochs,
                             validation_data=(self.x_test, self.x_test),  callbacks=[cp_callback, csv_callback])
